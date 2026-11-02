@@ -1,0 +1,7 @@
+# Dockerfile Single-stage thông thường (chứa toàn bộ JDK và mã nguồn thô)
+FROM eclipse-temurin:17-jdk-alpine
+WORKDIR /app
+COPY . .
+RUN chmod +x ./gradlew && ./gradlew bootJar && cp build/libs/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
