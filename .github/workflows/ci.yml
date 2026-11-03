@@ -1,22 +1,30 @@
-name: Cart Service CI
-on: [push]
+name: Monitoring CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
 
 jobs:
-  build:
+  validate-and-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          java-version: 17
-          distribution: temurin
+      # =================================================================
+      # Stage 1: Validate Config với promtool (Bài tập 6)
+      # =================================================================
+      - name: Validate Prometheus Configuration and Rules
+        run: |
+          docker run --rm -v ${{ github.workspace }}/prometheus:/etc/prometheus \
+            prom/prometheus:v2.51.0 promtool check config /etc/prometheus/prometheus.yml
 
-      - name: Make gradlew executable
-        run: chmod +x gradlew
-
-      - name: Build with Gradle
-        run: ./gradlew bootJar
-
+      # =================================================================
+      # Stage 2: Deploy Gatekeeper
+      # =================================================================
+      - name: Deploy Monitoring Configuration
+        if: success()
+        run: |
+          echo "Prometheus config validation passed successfully. Ready for deployment!"

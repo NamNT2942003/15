@@ -1,0 +1,25 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: quickbite-cart-service
+
+# =========================================================================
+# Cấu hình Spring Boot Actuator & Prometheus Metrics (Bài tập 5)
+# =========================================================================
+management:
+  endpoints:
+    web:
+      exposure:
+        # Bổ sung prometheus vào danh sách endpoint được phép truy cập qua Web
+        include: "health,info,prometheus"
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}

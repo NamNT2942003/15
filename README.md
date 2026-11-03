@@ -1,139 +1,343 @@
-# BÁO CÁO KỸ THUẬT: HOÀN THIỆN DOCKERFILE MULTI-STAGE BUILD
+# BÁO CÁO KỸ THUẬT: TỐI ƯU HÓA HỆ THỐNG GIÁM SÁT PROMETHEUS - GRAFANA & TỰ ĐỘNG HÓA CI/CD
 
 - **Dự án**: QuickBite Microservices Platform
-- **Service tối ưu**: `cart-service`
-- **Vị trí**: Junior DevOps Engineer
-- **Chủ đề**: Tối ưu hóa kích thước Docker Image & Bảo mật Container thông qua Multi-stage Build
+- **Học phần**: Monitoring, Alerting & Observability (Session 15)
 - **Tác giả**: NamNT (NamNTHE176286)
+- **Repository**: [NamNT2942003/15](https://github.com/NamNT2942003/15)
 
 ---
 
-## 1. BỐI CẢNH & MỤC TIÊU TỐI ƯU
-
-Trong chiến dịch tối ưu hóa hạ tầng của QuickBite, việc giảm thiểu dung lượng Docker Image cho các microservices mang lại 3 lợi ích sống còn:
-1. **Tốc độ triển khai (Deployment Velocity)**: Giảm băng thông và thời gian kéo (pull/push) image giữa Container Registry (Docker Hub, AWS ECR) và các Kubernetes Node / Docker Swarm.
-2. **Tối ưu tài nguyên lưu trữ**: Tiết kiệm không gian đĩa trên cả máy chủ CI/CD lẫn máy chủ Production.
-3. **Bảo mật mã nguồn (Security Hardening & Reduced Attack Surface)**:
-   - Loại bỏ hoàn toàn mã nguồn thô (`.java`), file cấu hình dev, git metadata, và các công cụ biên dịch (`javac`, Gradle daemon, header files C/C++) ra khỏi môi trường Production.
-   - Tin tặc không thể lợi dụng compiler hoặc source code thô nếu container bị thâm nhập.
+## MỤC LỤC
+1. [Bài tập 1: Sửa lỗi mất kết nối Grafana - Prometheus (Docker Internal DNS)](#bài-tập-1-sửa-lỗi-mất-kết-nối-grafana---prometheus)
+2. [Bài tập 2: Tối ưu hóa chu kỳ Scrape (Tránh quá tải tài nguyên)](#bài-tập-2-tối-ưu-hóa-chu-kỳ-scrape)
+3. [Bài tập 3: Xử lý cảnh báo giả False Alarm (Ngưỡng > 85%, for: 5m, promtool)](#bài-tập-3-xử-lý-cảnh-báo-giả-false-alarm)
+4. [Bài tập 4: Tự động hóa Giám sát với Prometheus Service Discovery (`file_sd_configs`)](#bài-tập-4-tự-động-hóa-giám-sát-với-prometheus-service-discovery)
+5. [Bài tập 5: Debug App bằng Metrics (Kích hoạt Spring Boot Actuator Prometheus Endpoint)](#bài-tập-5-debug-app-bằng-metrics)
+6. [Bài tập 6: Tích hợp Giám sát vào CI/CD (Fail-Fast Gatekeeper với `promtool`)](#bài-tập-6-tích-hợp-giám-sát-vào-cicd)
+7. [Tổng kết & Hướng dẫn kiểm thử toàn diện](#tổng-kết--hướng-dẫn-kiểm-thử-toàn-diện)
 
 ---
 
-## 2. PHÂN TÍCH CHI TIẾT CÁC VỊ TRÍ ĐIỀN KHUYẾT `[___]`
+## BÀI TẬP 1: SỬA LỖI MẤT KẾT NỐI GRAFANA - PROMETHEUS
 
-Đoạn mã Dockerfile ban đầu của lập trình viên:
+### 1. Hiện tượng & Log lỗi thực tế
+Khi container Prometheus bị khởi động lại do lệnh `docker-compose restart`, Docker Daemon giải phóng và cấp phát lại địa chỉ IP ngẫu nhiên trong dải bridge subnet. Do Datasource của Grafana đang hardcode IP tĩnh `http://192.168.1.15:9090`:
+- Toàn bộ dashboard trên Grafana rơi vào trạng thái **"No data"** hoặc hiển thị biểu tượng chấm than đỏ lỗi kết nối.
+- Trích xuất log lỗi từ container Grafana (`docker logs -f grafana`):
 
-```dockerfile
-# Stage 1: Build mã nguồn
-FROM eclipse-temurin:17-jdk-alpine AS builder
-WORKDIR /app
-COPY . .
-RUN ./gradlew bootJar
-
-# Stage 2: Runtime 
-FROM [___]
-WORKDIR /app
-[___]
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+```log
+logger=tsdb.prometheus t=2026-11-03T07:15:22.102Z level=error msg="Instant query failed" query="up" err="Post \"http://192.168.1.15:9090/api/v1/query\": dial tcp 192.168.1.15:9090: connect: connection refused"
+logger=context userId=1 orgId=1 uname=admin t=2026-11-03T07:15:22.103Z level=error msg="Internal server error" error="Post \"http://192.168.1.15:9090/api/v1/query_range\": dial tcp 192.168.1.15:9090: i/o timeout"
+logger=datasources t=2026-11-03T07:15:25.451Z level=error msg="Failed to check datasource health" id=1 name=Prometheus error="HTTP connection error"
 ```
 
-### 1️⃣ Vị trí 1: Base Image cho Stage 2 (`FROM [___]`)
-- **Giá trị điền**: `eclipse-temurin:17-jre-alpine`
-- **Phân tích kỹ thuật**:
-  - **Khác biệt cốt lõi giữa JDK và JRE**:
-    - **JDK (Java Development Kit)**: Chứa toàn bộ công cụ phát triển (trình biên dịch `javac`, công cụ debug `jdb`, profiler `jstack`, header file native). Những công cụ này chỉ cần thiết trong quá trình build mã nguồn (Stage 1), hoàn toàn **thừa thãi** khi chạy ứng dụng trên môi trường Production.
-    - **JRE (Java Runtime Environment)**: Chỉ chứa máy ảo Java Virtual Machine (JVM) và các thư viện lõi chuẩn cần thiết để thực thi bytecode (`.class`, `.jar`).
-  - **Lựa chọn Alpine Linux (`alpine`)**:
-    - Alpine Linux sử dụng thư viện siêu nhẹ `musl libc` và bộ tiện ích `busybox`, giúp kích thước base image hệ điều hành chỉ vỏn vẹn ~5MB (thay vì hơn 100MB của Debian/Ubuntu tiêu chuẩn).
-  - Do đó, việc kết hợp `eclipse-temurin:17` với phiên bản `jre-alpine` là sự lựa chọn tối ưu nhất cho Runtime của Spring Boot.
+### 2. Phân tích nguyên nhân & Cơ chế Docker Embedded DNS
+- **Bản chất của IP tĩnh**: Container IP là phù du (ephemeral). Không bao giờ được dùng IP nội bộ của container trong cấu hình dài hạn.
+- **Docker Embedded DNS**: Khi các service cùng khai báo chung mạng bridge (`monitoring-net`), Docker kích hoạt máy chủ DNS nội bộ tại địa chỉ `127.0.0.11`. DNS này tự động theo dõi và ánh xạ service name `prometheus` sang IP hiện hành của container.
 
-### 2️⃣ Vị trí 2: Chuyển giao Artifact giữa các Stage (`[___]`)
-- **Giá trị điền**: `COPY --from=builder /app/build/libs/*.jar app.jar`
-- **Phân tích kỹ thuật**:
-  - **Cú pháp Docker Multi-stage**:
-    $$\texttt{COPY --from=<Tên\_Stage\_Nguồn> <Đường\_dẫn\_File\_ở\_Stage\_Nguồn> <Đường\_dẫn\_Đích\_ở\_Stage\_Hiện\_Tại>}$$
-  - Ở Stage 1, container được gán nhãn đại diện là `AS builder`. Sau khi lệnh `./gradlew bootJar` thực thi thành công, file JAR đóng gói được sinh ra tại `/app/build/libs/cart-service-0.0.1.jar` (hoặc wildcard `*.jar`).
-  - Tham số `--from=builder` cho phép Docker trích xuất duy nhất file `.jar` từ Stage 1 sang Stage 2 và đổi tên thành `app.jar` mà không cần mang theo bất kỳ file mã nguồn `.java` hay file dependency trung gian nào.
+### 3. File cấu hình sửa đổi (`grafana/provisioning/datasources/datasource.yml`)
+```yaml
+apiVersion: 1
 
----
-
-## 3. DOCKERFILE HOÀN CHỈNH ([`Dockerfile`](Dockerfile))
-
-```dockerfile
-# =========================================================================
-# Dockerfile Multi-stage Build cho QuickBite cart-service
-# =========================================================================
-
-# Stage 1: Build mã nguồn (Biên dịch Java và đóng gói file JAR)
-FROM eclipse-temurin:17-jdk-alpine AS builder
-WORKDIR /app
-COPY . .
-# Cấp quyền thực thi và đóng gói ứng dụng Spring Boot
-RUN chmod +x ./gradlew && ./gradlew bootJar
-
-# Stage 2: Runtime (Môi trường thực thi tinh gọn, chỉ chứa JRE)
-FROM eclipse-temurin:17-jre-alpine
-WORKDIR /app
-
-# Chuyển giao artifact .jar từ Stage 1 sang Stage 2
-COPY --from=builder /app/build/libs/*.jar app.jar
-
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "app.jar"]
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
 ```
 
----
-
-## 4. ĐÁNH GIÁ THỰC NGHIỆM: SO SÁNH DUNG LƯỢNG SINGLE-STAGE VS MULTI-STAGE
-
-Để kiểm chứng hiệu quả thực tế, cả hai phiên bản Dockerfile đã được tiến hành build trực tiếp trên máy chủ cục bộ:
-- Phiên bản 1 (Single-stage): Sử dụng trực tiếp `eclipse-temurin:17-jdk-alpine` và giữ nguyên source code trong image.
-- Phiên bản 2 (Multi-stage): Sử dụng 2 giai đoạn (Builder: JDK Alpine $\rightarrow$ Runtime: JRE Alpine).
-
-### Bảng so sánh dung lượng thực tế
-
-| Tiêu chí | Single-stage Build (JDK) | Multi-stage Build (JRE) | Mức độ cải thiện |
-| :--- | :---: | :---: | :---: |
-| **Base Image** | `eclipse-temurin:17-jdk-alpine` | `eclipse-temurin:17-jre-alpine` | Giảm tải các thư viện dev thừa |
-| **Dung lượng Image** | **511 MB** | **256 MB** | **Giảm ~50% (~255 MB)** |
-| **Chứa Source Code `.java`?** | Có (Lộ mã nguồn thô) | **Không (Chỉ chứa `app.jar`)** | Tăng cường bảo mật |
-| **Chứa công cụ biên dịch (`javac`)?** | Có (Thừa thãi, rủi ro) | **Không (Chỉ có JVM runtime)** | Giảm thiểu diện tích tấn công |
-| **Thời gian khởi động** | Tương đương | Tương đương (1.52s) | Không ảnh hưởng hiệu năng |
-
-### Bằng chứng lệnh `docker images` trong Terminal
-
+### 4. Khởi động lại Grafana & Kiểm tra kết nối
 ```bash
-PS C:\Devop\15> docker images | findstr cart-service
-quickbite/cart-service                single-stage    49f464a8e537   2 minutes ago       511MB
-quickbite/cart-service                multi-stage     a4665e89990c   2 minutes ago       256MB
+# Khởi động lại container Grafana để nạp lại datasource provisioning
+docker compose restart grafana
 ```
-
-$$\implies \textbf{Kết luận: } \text{Kích thước Image giảm chính xác một nửa (từ 511MB xuống còn 256MB), loại bỏ hoàn toàn mã nguồn thô khỏi image production.}$$
+- Truy cập Grafana: `http://localhost:3000/datasources`
+- Nhấn **Save & test**: Nhận thông báo màu xanh lá `Successfully queried the Prometheus API.`
+- Mọi dashboard khôi phục biểu đồ và dữ liệu metrics đầy đủ.
 
 ---
 
-## 5. BẰNG CHỨNG THỰC NGHIỆM CONTAINER HOẠT ĐỘNG THÀNH CÔNG
+## BÀI TẬP 2: TỐI ƯU HÓA CHU KỲ SCRAPE
 
-Container xây dựng từ Multi-stage build được khởi chạy thử nghiệm để kiểm tra tính toàn vẹn của ứng dụng `cart-service`:
+### 1. Phân tích tác hại khi `scrape_interval: 1s`
+- **Quá tải CPU**: Prometheus phải mở socket TCP, gửi HTTP GET `/metrics`, bóc tách text format và nén time-series chunks liên tục mỗi 1 giây cho từng target.
+- **Tràn bộ nhớ đệm (RAM Bloat)**: Head block trong RAM phải tiếp nhận lượng samples gấp 15 lần.
+- **Áp lực Disk I/O & WAL**: Khối lượng ghi dữ liệu vào Write-Ahead Log tăng vọt, tiêu tốn IOPS đĩa cứng.
+- **Tác động ngược lên ứng dụng mục tiêu**: Service backend liên tục bị chiếm tài nguyên thread pool để export metrics.
 
+### 2. Giải pháp tối ưu: Chu kỳ `15s`
+Nâng `scrape_interval` và `evaluation_interval` lên `15s`:
+- Giảm hơn 93% số lượng HTTP requests và tải nén TSDB.
+- Chu kỳ 15 giây là tiêu chuẩn vàng, đảm bảo đồ thị Grafana mượt mà mà không làm nghẽn hệ thống.
+
+### 3. Cấu hình `prometheus/prometheus.yml`
+```yaml
+global:
+  scrape_interval: 15s      # Đã điều chỉnh từ 1s thành 15s
+  evaluation_interval: 15s  # Chu kỳ 15s đánh giá alerting rules
+
+scrape_configs:
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "backend-app"
+    static_configs:
+      - targets: ["backend:8080"]
+```
+
+### 4. Cơ chế Reload cấu hình Zero-Downtime
+Kích hoạt flag `--web.enable-lifecycle` trong `docker-compose.yml`. Khi sửa đổi cấu hình, reload tức thì không cần restart container:
 ```bash
-PS C:\Devop\15> docker run -d --name test-cart-multistage -p 8080:8080 quickbite/cart-service:multi-stage
-0967e40391207a5ae1f5d0c1d88056ff40cd92e3c182ade6d3356cb9815cddc5
-
-PS C:\Devop\15> docker logs test-cart-multistage
-2026-11-02 12:52:36.380  INFO 1 --- [main] c.q.c.CartServiceApplication         : Starting CartServiceApplication v0.0.1 using Java 17...
-2026-11-02 12:52:36.500  INFO 1 --- [main] o.s.b.w.embedded.tomcat.TomcatWebServer  : Tomcat started on port(s): 8082 (http)
-2026-11-02 12:52:36.500  INFO 1 --- [main] c.q.c.CartServiceApplication         : Started CartServiceApplication in 1.52 seconds
+curl -X POST http://localhost:9090/-/reload
 ```
 
 ---
 
-## 6. HƯỚNG DẪN NỘP BÀI LÊN PORTAL
+## BÀI TẬP 3: XỬ LÝ CẢNH BÁO GIẢ (FALSE ALARM)
 
-1. **File nộp**: Tệp tin [`Dockerfile`](Dockerfile) hoàn chỉnh theo đúng cấu trúc ở Mục 3.
-2. **Hình ảnh nộp**: Ảnh chụp màn hình cửa sổ Terminal chạy lệnh:
-   ```bash
-   docker images | grep cart-service
-   ```
-   Hiển thị rõ 2 dòng `quickbite/cart-service:single-stage` (511MB) và `quickbite/cart-service:multi-stage` (256MB) để chứng minh mức độ tối ưu hóa dung lượng image.
+### 1. Phân tích nguyên nhân "Alert Fatigue"
+File ban đầu:
+```yaml
+expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100) > 20
+for: 10s
+```
+- Ngưỡng `> 20%` quá thấp; các tác vụ thông thường (khởi động JVM, chạy batch job) đều dễ dàng chạm mốc này.
+- Thời gian `for: 10s` quá ngắn; các biến động tức thời (transient spikes) kích hoạt cảnh báo liên tục, gây ngập lụt email (Spam / Alert Fatigue).
+
+### 2. Cấu hình khắc phục (`prometheus/alert_rules.yml`)
+- Tăng ngưỡng cảnh báo lên `> 85%`.
+- Tăng thời gian duy trì `for` lên `5m` (5 phút liên tục).
+
+```yaml
+groups:
+  - name: CPU_Alerts
+    rules:
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[1m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage detected on {{ $labels.instance }}"
+          description: "CPU usage has exceeded 85% (current: {{ $value | printf \"%.2f\" }}%) continuously for more than 5 minutes."
+```
+
+### 3. Kiểm tra cú pháp bằng `promtool`
+Chạy lệnh kiểm tra tính hợp lệ của rule:
+```bash
+docker run --rm -v "${PWD}/prometheus:/etc/prometheus" \
+  prom/prometheus:v2.51.0 promtool check rules /etc/prometheus/alert_rules.yml
+```
+
+**Kết quả kiểm tra:**
+```text
+Checking /etc/prometheus/alert_rules.yml
+  SUCCESS: 1 rules found
+```
+
+---
+
+## BÀI TẬP 4: TỰ ĐỘNG HÓA GIÁM SÁT VỚI PROMETHEUS SERVICE DISCOVERY
+
+### 1. Hạn chế của `static_configs` và Sức mạnh của `file_sd_configs`
+Trong mô hình Microservices, số lượng container liên tục co giãn (autoscaling). Với `static_configs`, mỗi lần thêm/bớt container đều phải sửa file `prometheus.yml` và reload/restart Prometheus, gây rủi ro downtime và sai sót cú pháp.
+
+Với `file_sd_configs`:
+- Prometheus tự động lắng nghe sự kiện thay đổi file qua `inotify` và quét định kỳ `refresh_interval`.
+- Chỉ cần cập nhật file danh sách JSON/YAML, Prometheus tự động nạp target mới mà **không cần restart hay reload**.
+
+### 2. File danh sách mục tiêu (`prometheus/targets.json`)
+Khai báo 2 IP cùng nhãn `env: production`:
+```json
+[
+  {
+    "targets": [
+      "10.0.0.51:8080",
+      "10.0.0.52:8080"
+    ],
+    "labels": {
+      "env": "production"
+    }
+  }
+]
+```
+
+### 3. Tích hợp vào `prometheus/prometheus.yml`
+```yaml
+  - job_name: "microservices"
+    file_sd_configs:
+      - files:
+          - "targets.json"
+        refresh_interval: 30s
+```
+
+---
+
+## BÀI TẬP 5: DEBUG APP BẰNG METRICS (SPRING BOOT ACTUATOR)
+
+### 1. Nguyên nhân lỗi HTTP 404 `/actuator/prometheus`
+- Spring Boot Actuator mặc định chỉ mở duy nhất endpoint `/health` qua Web để đảm bảo an toàn.
+- Cấu hình ban đầu của đội Dev:
+  ```yaml
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: "health,info"
+  ```
+  Endpoint `prometheus` bị loại trừ nên Web Router không đăng ký URL `/actuator/prometheus`, dẫn tới lỗi HTTP 404 khi Prometheus scrape.
+
+### 2. Cấu hình khắc phục (`src/main/resources/application.yml`)
+```yaml
+server:
+  port: 8080
+
+spring:
+  application:
+    name: quickbite-cart-service
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "health,info,prometheus"
+      base-path: /actuator
+  endpoint:
+    health:
+      show-details: always
+    prometheus:
+      enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
+```
+
+### 3. Kiểm tra kết quả
+- Gọi trực tiếp endpoint:
+  ```bash
+  curl -i http://localhost:8080/actuator/prometheus
+  ```
+  Nhận về mã phản hồi `HTTP/1.1 200 OK` kèm nội dung OpenMetrics chuẩn (`jvm_memory_used_bytes`, `jvm_threads_live_threads`, `http_server_requests_seconds_count`).
+- Trên giao diện Prometheus tại `http://localhost:9090/targets`, target `cart-service` chuyển từ `DOWN` sang `UP` màu xanh lá.
+
+---
+
+## BÀI TẬP 6: TÍCH HỢP GIÁM SÁT VÀO CI/CD (FAIL-FAST GATEKEEPER)
+
+### 1. Phân tích rủi ro & Nguyên lý Fail-Fast
+Nếu kỹ sư gõ nhầm dấu tab hoặc sai cú pháp YAML trong cấu hình Prometheus, việc deploy trực tiếp sẽ làm sập container Prometheus trên Production. Để loại trừ rủi ro này, pipeline CI/CD bắt buộc phải có một cổng kiểm soát (Gatekeeper) chạy `promtool check config` trước khi cấp phép deploy.
+
+### 2. Cấu hình Jenkinsfile (`Jenkinsfile`)
+```groovy
+pipeline {
+    agent any
+
+    stages {
+        stage('Validate Config') {
+            steps {
+                echo '=== BẮT ĐẦU KIỂM TRA TÍNH HỢP LỆ CỦA CẤU HÌNH PROMETHEUS ==='
+                script {
+                    sh '''
+                        docker run --rm -v "${WORKSPACE}/prometheus:/etc/prometheus" \
+                            prom/prometheus:v2.51.0 promtool check config /etc/prometheus/prometheus.yml
+                    '''
+                    echo '>>> Cấu hình Prometheus và Rules hoàn toàn hợp lệ! Tiếp tục deploy...'
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo '=== BẮT ĐẦU TRIỂN KHAI RELOAD / RESTART PROMETHEUS ==='
+                sh '''
+                    curl -s -X POST http://localhost:9090/-/reload || docker restart prometheus
+                '''
+                echo '>>> Triển khai cấu hình giám sát thành công!'
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo 'CRITICAL: Pipeline thất bại tại bước Validate! Không thực hiện restart container.'
+        }
+        success {
+            echo 'SUCCESS: Toàn bộ quy trình kiểm tra và triển khai hoàn tất thành công.'
+        }
+    }
+}
+```
+
+### 3. Cấu hình GitHub Actions (`.github/workflows/ci.yml`)
+```yaml
+name: Monitoring CI/CD Pipeline
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Validate Prometheus Configuration and Rules
+        run: |
+          docker run --rm -v ${{ github.workspace }}/prometheus:/etc/prometheus \
+            prom/prometheus:v2.51.0 promtool check config /etc/prometheus/prometheus.yml
+
+      - name: Deploy Monitoring Configuration
+        if: success()
+        run: |
+          echo "Prometheus config validation passed successfully. Ready for deployment!"
+```
+
+---
+
+## TỔNG KẾT & HƯỚNG DẪN KIỂM THỬ TOÀN DIỆN
+
+### 1. Cấu trúc mã nguồn hoàn chỉnh
+```text
+C:\Devop\15\
+├── Jenkinsfile                             # Bài 6: CI/CD Pipeline với Stage Validate Config
+├── .github/workflows/ci.yml                # Bài 6: GitHub Actions Workflow
+├── docker-compose.yml                      # Bài 1, 2, 5: Cụm service cart-service, prometheus, grafana
+├── Dockerfile                              # Multi-stage build cho Spring Boot cart-service
+├── src/
+│   ├── main/
+│   │   ├── java/com/quickbite/cart/
+│   │   │   └── CartServiceApplication.java # Bài 5: Xử lý endpoint /actuator/prometheus
+│   │   └── resources/
+│   │       └── application.yml             # Bài 5: Cấu hình exposure include prometheus
+├── prometheus/
+│   ├── prometheus.yml                      # Bài 2: Chu kỳ 15s | Bài 3: Rule files | Bài 4: file_sd
+│   ├── alert_rules.yml                     # Bài 3: Ngưỡng CPU > 85%, for: 5m
+│   └── targets.json                        # Bài 4: Khai báo 2 IP với nhãn env: production
+├── grafana/
+│   └── provisioning/
+│       └── datasources/
+│           └── datasource.yml              # Bài 1: Cấu hình URL http://prometheus:9090
+└── README.md                               # Báo cáo kỹ thuật chi tiết toàn diện
+```
+
+### 2. Các lệnh vận hành nhanh
+```bash
+# 1. Khởi chạy toàn bộ hệ thống
+docker compose up -d
+
+# 2. Kiểm tra tính hợp lệ của cấu hình giám sát
+docker run --rm -v "${PWD}/prometheus:/etc/prometheus" prom/prometheus:v2.51.0 promtool check config /etc/prometheus/prometheus.yml
+
+# 3. Reload cấu hình không downtime
+curl -X POST http://localhost:9090/-/reload
+
+# 4. Kiểm tra metric endpoint của ứng dụng
+curl http://localhost:8080/actuator/prometheus
+```
